@@ -178,7 +178,6 @@ pub fn comparison_throughput(
             .configure(Grid::Minor, |g| g.hide())
             .set(Label(format!("Average throughput ({})", unit)))
             .set(axis_scale.to_gnuplot())
-            .set(Range::Limits(0., max_formatted[0]))
     });
 
     // This assumes the curves are sorted. It also assumes that the benchmark IDs all have numeric
