@@ -22,9 +22,9 @@
 #![cfg_attr(
     feature = "cargo-clippy",
     allow(
-        clippy::used_underscore_binding,
-        clippy::just_underscores_and_digits,
-        clippy::transmute_ptr_to_ptr
+        clippy::just_underscores_and_digits, // Used in the stats code
+        clippy::transmute_ptr_to_ptr, // Used in the stats code
+        clippy::option_as_ref_deref, // Remove when MSRV bumped above 1.40
     )
 )]
 
@@ -36,29 +36,11 @@ extern crate approx;
 #[macro_use]
 extern crate quickcheck;
 
-#[cfg(test)]
-extern crate rand;
-
-#[macro_use]
-extern crate clap;
+use clap::value_t;
+use regex::Regex;
 
 #[macro_use]
 extern crate lazy_static;
-
-extern crate atty;
-extern crate cast;
-extern crate criterion_plot;
-extern crate csv;
-extern crate itertools;
-extern crate num_traits;
-extern crate rand_core;
-extern crate rand_os;
-extern crate rand_xoshiro;
-extern crate rayon;
-extern crate serde;
-extern crate serde_json;
-extern crate tinytemplate;
-extern crate walkdir;
 
 #[cfg(feature = "real_blackbox")]
 extern crate test;
@@ -96,7 +78,11 @@ use std::default::Default;
 use std::fmt;
 use std::iter::IntoIterator;
 use std::marker::PhantomData;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+use std::time::Instant;
+
+use criterion_plot::{Version, VersionError};
 
 use crate::benchmark::BenchmarkConfig;
 use crate::benchmark::NamedRoutine;
@@ -104,16 +90,32 @@ use crate::csv_report::FileCsvReport;
 use crate::estimate::{Distributions, Estimates, Statistic};
 use crate::html::Html;
 use crate::measurement::{Measurement, WallTime};
-use crate::plotting::Plotting;
+use crate::plot::{Gnuplot, Plotter, PlottersBackend};
 use crate::profiler::{ExternalProfiler, Profiler};
-use crate::report::{CliReport, Report, ReportContext, Reports};
+use crate::report::{BencherReport, CliReport, Report, ReportContext, Reports};
 use crate::routine::Function;
 
 pub use crate::benchmark::{Benchmark, BenchmarkDefinition, ParameterizedBenchmark};
 pub use crate::benchmark_group::{BenchmarkGroup, BenchmarkId};
 
 lazy_static! {
-    static ref DEBUG_ENABLED: bool = { std::env::vars().any(|(key, _)| key == "CRITERION_DEBUG") };
+    static ref DEBUG_ENABLED: bool = std::env::var_os("CRITERION_DEBUG").is_some();
+    static ref GNUPLOT_VERSION: Result<Version, VersionError> = criterion_plot::version();
+    static ref DEFAULT_PLOTTING_BACKEND: PlottingBackend = {
+        match &*GNUPLOT_VERSION {
+            Ok(_) => PlottingBackend::Gnuplot,
+            Err(e) => {
+                match e {
+                    VersionError::Exec(_) => println!("Gnuplot not found, using plotters backend"),
+                    e => println!(
+                        "Gnuplot not found or not usable, using plotters backend\n{}",
+                        e
+                    ),
+                };
+                PlottingBackend::Plotters
+            }
+        }
+    };
 }
 
 fn debug_enabled() -> bool {
@@ -159,7 +161,7 @@ where
     /// Create a new `Fun` given a name and a closure
     pub fn new<F>(name: &str, f: F) -> Fun<I, M>
     where
-        F: FnMut(&mut Bencher<M>, &I) + 'static,
+        F: FnMut(&mut Bencher<'_, M>, &I) + 'static,
     {
         let routine = NamedRoutine {
             id: name.to_owned(),
@@ -276,10 +278,11 @@ impl BatchSize {
 ///   but are more complex than `iter_with_large_drop`.
 /// * Otherwise, use `iter`.
 pub struct Bencher<'a, M: Measurement = WallTime> {
-    iterated: bool,
-    iters: u64,
-    value: M::Value,
-    measurement: &'a M,
+    iterated: bool,         // have we iterated this benchmark?
+    iters: u64,             // Number of times to iterate this benchmark
+    value: M::Value,        // The measured value
+    measurement: &'a M,     // Reference to the measurement object
+    elapsed_time: Duration, // How much time did it take to perform the iteration? Used for the warmup period.
 }
 impl<'a, M: Measurement> Bencher<'a, M> {
     /// Times a `routine` by executing it many times and timing the total elapsed time.
@@ -324,16 +327,18 @@ impl<'a, M: Measurement> Bencher<'a, M> {
         R: FnMut() -> O,
     {
         self.iterated = true;
+        let time_start = Instant::now();
         let start = self.measurement.start();
         for _ in 0..self.iters {
             black_box(routine());
         }
         self.value = self.measurement.end(start);
+        self.elapsed_time = time_start.elapsed();
     }
 
-    /// Times a `routine` by executing it many times and relying on `routine` to measure it's own execution time.
+    /// Times a `routine` by executing it many times and relying on `routine` to measure its own execution time.
     ///
-    /// Prefer this timing loop in cases where `routine` has to do it's own measurements to
+    /// Prefer this timing loop in cases where `routine` has to do its own measurements to
     /// get accurate timing information (for example in multi-threaded scenarios where you spawn
     /// and coordinate with multiple threads).
     ///
@@ -373,7 +378,9 @@ impl<'a, M: Measurement> Bencher<'a, M> {
         R: FnMut(u64) -> M::Value,
     {
         self.iterated = true;
+        let time_start = Instant::now();
         self.value = routine(self.iters);
+        self.elapsed_time = time_start.elapsed();
     }
 
     #[doc(hidden)]
@@ -437,7 +444,7 @@ impl<'a, M: Measurement> Bencher<'a, M> {
     }
 
     /// Times a `routine` that requires some input by generating a batch of input, then timing the
-    /// iteration of the benchmark over the input. See [`BatchSize`](struct.BatchSize.html) for
+    /// iteration of the benchmark over the input. See [`BatchSize`](enum.BatchSize.html) for
     /// details on choosing the batch size. Use this when the routine must consume its input.
     ///
     /// For example, use this loop to benchmark sorting algorithms, because they require unsorted
@@ -488,6 +495,7 @@ impl<'a, M: Measurement> Bencher<'a, M> {
         self.iterated = true;
         let batch_size = size.iters_per_batch(self.iters);
         assert!(batch_size != 0, "Batch size must not be zero.");
+        let time_start = Instant::now();
         self.value = self.measurement.zero();
 
         if batch_size == 1 {
@@ -520,10 +528,12 @@ impl<'a, M: Measurement> Bencher<'a, M> {
                 iteration_counter += batch_size;
             }
         }
+
+        self.elapsed_time = time_start.elapsed();
     }
 
     /// Times a `routine` that requires some input by generating a batch of input, then timing the
-    /// iteration of the benchmark over the input. See [`BatchSize`](struct.BatchSize.html) for
+    /// iteration of the benchmark over the input. See [`BatchSize`](enum.BatchSize.html) for
     /// details on choosing the batch size. Use this when the routine should accept the input by
     /// mutable reference.
     ///
@@ -575,6 +585,7 @@ impl<'a, M: Measurement> Bencher<'a, M> {
         self.iterated = true;
         let batch_size = size.iters_per_batch(self.iters);
         assert!(batch_size != 0, "Batch size must not be zero.");
+        let time_start = Instant::now();
         self.value = self.measurement.zero();
 
         if batch_size == 1 {
@@ -608,6 +619,7 @@ impl<'a, M: Measurement> Bencher<'a, M> {
                 iteration_counter += batch_size;
             }
         }
+        self.elapsed_time = time_start.elapsed();
     }
 
     // Benchmarks must actually call one of the iter methods. This causes benchmarks to fail loudly
@@ -621,6 +633,7 @@ impl<'a, M: Measurement> Bencher<'a, M> {
 }
 
 /// Baseline describes how the baseline_directory is handled.
+#[derive(Debug, Clone, Copy)]
 pub enum Baseline {
     /// Compare ensures a previous saved version of the baseline
     /// exists and runs comparison against that.
@@ -628,6 +641,17 @@ pub enum Baseline {
     /// Save writes the benchmark results to the baseline directory,
     /// overwriting any results that were previously there.
     Save,
+}
+
+/// Enum used to select the plotting backend.
+#[derive(Debug, Clone, Copy)]
+pub enum PlottingBackend {
+    /// Plotting backend which uses the external `gnuplot` command to render plots. This is the
+    /// default if the `gnuplot` command is installed.
+    Gnuplot,
+    /// Plotting backend which uses the rust 'Plotters' library. This is the default if `gnuplot`
+    /// is not installed.
+    Plotters,
 }
 
 /// The benchmark manager
@@ -646,13 +670,15 @@ pub enum Baseline {
 /// benchmark.
 pub struct Criterion<M: Measurement = WallTime> {
     config: BenchmarkConfig,
-    plotting: Plotting,
-    filter: Option<String>,
+    plotting_backend: PlottingBackend,
+    plotting_enabled: bool,
+    filter: Option<Regex>,
     report: Box<dyn Report>,
-    output_directory: String,
+    output_directory: PathBuf,
     baseline_directory: String,
     baseline: Baseline,
     profile_time: Option<Duration>,
+    load_baseline: Option<String>,
     test_mode: bool,
     list_mode: bool,
     all_directories: HashSet<String>,
@@ -671,21 +697,21 @@ impl Default for Criterion {
     /// - Noise threshold: 0.01 (1%)
     /// - Confidence level: 0.95
     /// - Significance level: 0.05
-    /// - Plotting: enabled (if gnuplot is available)
+    /// - Plotting: enabled, using gnuplot if available or plotters if gnuplot is not available
     /// - No filter
     fn default() -> Criterion {
-        #[allow(unused_mut, unused_assignments)]
-        let mut plotting = Plotting::Unset;
-
         let mut reports: Vec<Box<dyn Report>> = vec![];
         reports.push(Box::new(CliReport::new(false, false, false)));
         reports.push(Box::new(FileCsvReport));
 
-        let output_directory =
-            match std::env::vars().find(|&(ref key, _)| key == "CARGO_TARGET_DIR") {
-                Some((_, value)) => format!("{}/criterion", value),
-                None => "target/criterion".to_owned(),
-            };
+        let output_directory = match std::env::var_os("CARGO_TARGET_DIR") {
+            Some(value) => {
+                let mut target_dir = PathBuf::from(value);
+                target_dir.push("criterion");
+                target_dir
+            }
+            None => "target/criterion".into(),
+        };
 
         Criterion {
             config: BenchmarkConfig {
@@ -697,12 +723,14 @@ impl Default for Criterion {
                 significance_level: 0.05,
                 warm_up_time: Duration::new(3, 0),
             },
-            plotting,
+            plotting_backend: *DEFAULT_PLOTTING_BACKEND,
+            plotting_enabled: true,
             filter: None,
             report: Box::new(Reports::new(reports)),
             baseline_directory: "base".to_owned(),
             baseline: Baseline::Save,
             profile_time: None,
+            load_baseline: None,
             test_mode: false,
             list_mode: false,
             output_directory,
@@ -720,12 +748,14 @@ impl<M: Measurement> Criterion<M> {
     pub fn with_measurement<M2: Measurement>(self, m: M2) -> Criterion<M2> {
         Criterion {
             config: self.config,
-            plotting: self.plotting,
+            plotting_backend: self.plotting_backend,
+            plotting_enabled: self.plotting_enabled,
             filter: self.filter,
             report: self.report,
             baseline_directory: self.baseline_directory,
             baseline: self.baseline,
             profile_time: self.profile_time,
+            load_baseline: self.load_baseline,
             test_mode: self.test_mode,
             list_mode: self.list_mode,
             output_directory: self.output_directory,
@@ -741,6 +771,23 @@ impl<M: Measurement> Criterion<M> {
     pub fn with_profiler<P: Profiler + 'static>(self, p: P) -> Criterion<M> {
         Criterion {
             profiler: Box::new(RefCell::new(p)),
+            ..self
+        }
+    }
+
+    /// Set the plotting backend. By default, Criterion will use gnuplot if available, or plotters
+    /// if not.
+    ///
+    /// Panics if `backend` is `PlottingBackend::Gnuplot` and gnuplot is not available.
+    pub fn plotting_backend(self, backend: PlottingBackend) -> Criterion<M> {
+        if let PlottingBackend::Gnuplot = backend {
+            if GNUPLOT_VERSION.is_err() {
+                panic!("Gnuplot plotting backend was requested, but gnuplot is not available. To continue, either install Gnuplot or allow Criterion.rs to fall back to using plotters.");
+            }
+        }
+
+        Criterion {
+            plotting_backend: backend,
             ..self
         }
     }
@@ -804,21 +851,26 @@ impl<M: Measurement> Criterion<M> {
     /// Panics if the number of resamples is set to zero
     pub fn nresamples(mut self, n: usize) -> Criterion<M> {
         assert!(n > 0);
+        if n <= 1000 {
+            println!("\nWarning: It is not recommended to reduce nresamples below 1000.");
+        }
 
         self.config.nresamples = n;
         self
     }
 
-    /// Changes the default noise threshold for benchmarks run with this runner.
+    /// Changes the default noise threshold for benchmarks run with this runner. The noise threshold
+    /// is used to filter out small changes in performance, even if they are statistically
+    /// significant. Sometimes benchmarking the same code twice will result in small but
+    /// statistically significant differences solely because of noise. This provides a way to filter
+    /// out some of these false positives at the cost of making it harder to detect small changes
+    /// to the true performance of the benchmark.
     ///
-    /// This threshold is used to decide if an increase of `X%` in the execution time is considered
-    /// significant or should be flagged as noise
-    ///
-    /// *Note:* A value of `0.02` is equivalent to `2%`
+    /// The default is 0.01, meaning that changes smaller than 1% will be ignored.
     ///
     /// # Panics
     ///
-    /// Panics is the threshold is set to a negative value
+    /// Panics if the threshold is set to a negative value
     pub fn noise_threshold(mut self, threshold: f64) -> Criterion<M> {
         assert!(threshold >= 0.0);
 
@@ -826,27 +878,40 @@ impl<M: Measurement> Criterion<M> {
         self
     }
 
-    /// Changes the default confidence level for benchmarks run with this runner
-    ///
-    /// The confidence level is used to calculate the
-    /// [confidence intervals](https://en.wikipedia.org/wiki/Confidence_interval) of the estimated
-    /// statistics
+    /// Changes the default confidence level for benchmarks run with this runner. The confidence
+    /// level is the desired probability that the true runtime lies within the estimated
+    /// [confidence interval](https://en.wikipedia.org/wiki/Confidence_interval). The default is
+    /// 0.95, meaning that the confidence interval should capture the true value 95% of the time.
     ///
     /// # Panics
     ///
     /// Panics if the confidence level is set to a value outside the `(0, 1)` range
     pub fn confidence_level(mut self, cl: f64) -> Criterion<M> {
         assert!(cl > 0.0 && cl < 1.0);
+        if cl < 0.5 {
+            println!("\nWarning: It is not recommended to reduce confidence level below 0.5.");
+        }
 
         self.config.confidence_level = cl;
         self
     }
 
     /// Changes the default [significance level](https://en.wikipedia.org/wiki/Statistical_significance)
-    /// for benchmarks run with this runner
+    /// for benchmarks run with this runner. This is used to perform a
+    /// [hypothesis test](https://en.wikipedia.org/wiki/Statistical_hypothesis_testing) to see if
+    /// the measurements from this run are different from the measured performance of the last run.
+    /// The significance level is the desired probability that two measurements of identical code
+    /// will be considered 'different' due to noise in the measurements. The default value is 0.05,
+    /// meaning that approximately 5% of identical benchmarks will register as different due to
+    /// noise.
     ///
-    /// The significance level is used for
-    /// [hypothesis testing](https://en.wikipedia.org/wiki/Statistical_hypothesis_testing)
+    /// This presents a trade-off. By setting the significance level closer to 0.0, you can increase
+    /// the statistical robustness against noise, but it also weaken's Criterion.rs' ability to
+    /// detect small but real changes in the performance. By setting the significance level
+    /// closer to 1.0, Criterion.rs will be more able to detect small true changes, but will also
+    /// report more spurious differences.
+    ///
+    /// See also the noise threshold setting.
     ///
     /// # Panics
     ///
@@ -858,43 +923,40 @@ impl<M: Measurement> Criterion<M> {
         self
     }
 
+    fn create_plotter(&self) -> Box<dyn Plotter> {
+        match self.plotting_backend {
+            PlottingBackend::Gnuplot => Box::new(Gnuplot::default()),
+            PlottingBackend::Plotters => Box::new(PlottersBackend::default()),
+        }
+    }
+
     /// Enables plotting
     pub fn with_plots(mut self) -> Criterion<M> {
-        use criterion_plot::VersionError;
-        self.plotting = match criterion_plot::version() {
-            Ok(_) => {
-                let mut reports: Vec<Box<dyn Report>> = vec![];
-                reports.push(Box::new(CliReport::new(false, false, false)));
-                reports.push(Box::new(FileCsvReport));
-                reports.push(Box::new(Html::new()));
-                self.report = Box::new(Reports::new(reports));
-                Plotting::Enabled
-            }
-            Err(e) => {
-                match e {
-                    VersionError::Exec(_) => println!("Gnuplot not found, disabling plotting"),
-                    e => println!("Gnuplot not found or not usable, disabling plotting\n{}", e),
-                }
-                Plotting::NotAvailable
-            }
-        };
+        self.plotting_enabled = true;
+        let mut reports: Vec<Box<dyn Report>> = vec![];
+        reports.push(Box::new(CliReport::new(false, false, false)));
+        reports.push(Box::new(FileCsvReport));
+        reports.push(Box::new(Html::new(self.create_plotter())));
+        self.report = Box::new(Reports::new(reports));
 
         self
     }
 
     /// Disables plotting
     pub fn without_plots(mut self) -> Criterion<M> {
-        self.plotting = Plotting::Disabled;
+        self.plotting_enabled = false;
+        let mut reports: Vec<Box<dyn Report>> = vec![];
+        reports.push(Box::new(CliReport::new(false, false, false)));
+        reports.push(Box::new(FileCsvReport));
+        self.report = Box::new(Reports::new(reports));
         self
     }
 
     /// Return true if generation of the plots is possible.
     pub fn can_plot(&self) -> bool {
-        match self.plotting {
-            Plotting::NotAvailable => false,
-            Plotting::Enabled => true,
-            _ => criterion_plot::version().is_ok(),
-        }
+        // Trivially true now that we have plotters.
+        // TODO: Deprecate and remove this.
+        true
     }
 
     /// Names an explicit baseline and enables overwriting the previous results.
@@ -914,15 +976,22 @@ impl<M: Measurement> Criterion<M> {
     /// Filters the benchmarks. Only benchmarks with names that contain the
     /// given string will be executed.
     pub fn with_filter<S: Into<String>>(mut self, filter: S) -> Criterion<M> {
-        self.filter = Some(filter.into());
+        let filter_text = filter.into();
+        let filter = Regex::new(&filter_text).unwrap_or_else(|err| {
+            panic!(
+                "Unable to parse '{}' as a regular expression: {}",
+                filter_text, err
+            )
+        });
+        self.filter = Some(filter);
 
         self
     }
 
     /// Set the output directory (currently for testing only)
     #[doc(hidden)]
-    pub fn output_directory(mut self, path: &std::path::Path) -> Criterion<M> {
-        self.output_directory = path.to_string_lossy().into_owned();
+    pub fn output_directory(mut self, path: &Path) -> Criterion<M> {
+        self.output_directory = path.to_owned();
 
         self
     }
@@ -944,7 +1013,6 @@ impl<M: Measurement> Criterion<M> {
 
         let report_context = ReportContext {
             output_directory: self.output_directory.clone(),
-            plotting: self.plotting,
             plot_config: PlotConfiguration::default(),
             test_mode: self.test_mode,
         };
@@ -995,34 +1063,40 @@ impl<M: Measurement> Criterion<M> {
                 .long("profile-time")
                 .takes_value(true)
                 .help("Iterate each benchmark for approximately the given number of seconds, doing no analysis and without storing the results. Useful for running the benchmarks in a profiler."))
+            .arg(Arg::with_name("load-baseline")
+                 .long("load-baseline")
+                 .takes_value(true)
+                 .conflicts_with("profile-time")
+                 .requires("baseline")
+                 .help("Load a previous baseline instead of sampling new data."))
             .arg(Arg::with_name("sample-size")
                 .long("sample-size")
                 .takes_value(true)
-                .help("Changes the default size of the sample for this run."))
+                .help(&format!("Changes the default size of the sample for this run. [default: {}]", self.config.sample_size)))
             .arg(Arg::with_name("warm-up-time")
                 .long("warm-up-time")
                 .takes_value(true)
-                .help("Changes the default warm up time for this run."))
+                .help(&format!("Changes the default warm up time for this run. [default: {}]", self.config.warm_up_time.as_secs())))
             .arg(Arg::with_name("measurement-time")
                 .long("measurement-time")
                 .takes_value(true)
-                .help("Changes the default measurement time for this run."))
+                .help(&format!("Changes the default measurement time for this run. [default: {}]", self.config.measurement_time.as_secs())))
             .arg(Arg::with_name("nresamples")
                 .long("nresamples")
                 .takes_value(true)
-                .help("Changes the default number of resamples for this run."))
+                .help(&format!("Changes the default number of resamples for this run. [default: {}]", self.config.nresamples)))
             .arg(Arg::with_name("noise-threshold")
                 .long("noise-threshold")
                 .takes_value(true)
-                .help("Changes the default noise threshold for this run."))
+                .help(&format!("Changes the default noise threshold for this run. [default: {}]", self.config.noise_threshold)))
             .arg(Arg::with_name("confidence-level")
                 .long("confidence-level")
                 .takes_value(true)
-                .help("Changes the default confidence level for this run."))
+                .help(&format!("Changes the default confidence level for this run. [default: {}]", self.config.confidence_level)))
             .arg(Arg::with_name("significance-level")
                 .long("significance-level")
                 .takes_value(true)
-                .help("Changes the default significance level for this run."))
+                .help(&format!("Changes the default significance level for this run. [default: {}]", self.config.significance_level)))
             .arg(Arg::with_name("test")
                 .hidden(true)
                 .long("test")
@@ -1030,6 +1104,21 @@ impl<M: Measurement> Criterion<M> {
             .arg(Arg::with_name("bench")
                 .hidden(true)
                 .long("bench"))
+            .arg(Arg::with_name("plotting-backend")
+                 .long("plotting-backend")
+                 .takes_value(true)
+                 .possible_values(&["gnuplot", "plotters"])
+                 .help("Set the plotting backend. By default, Criterion.rs will use the gnuplot backend if gnuplot is available, or the plotters backend if it isn't."))
+            .arg(Arg::with_name("output-format")
+                .long("output-format")
+                .takes_value(true)
+                .possible_values(&["criterion", "bencher"])
+                .default_value("criterion")
+                .help("Change the CLI output format. By default, Criterion.rs will use its own format. If output format is set to 'bencher', Criterion.rs will print output in a format that resembles the 'bencher' crate."))
+            .arg(Arg::with_name("nocapture")
+                .long("nocapture")
+                .hidden(true)
+                .help("Ignored, but added for compatibility with libtest."))
             .arg(Arg::with_name("version")
                 .hidden(true)
                 .short("V")
@@ -1050,19 +1139,12 @@ To test that the benchmarks work, run `cargo test --benches`
             self = self.with_filter(filter);
         }
 
-        let verbose = matches.is_present("verbose");
-        let stdout_isatty = atty::is(atty::Stream::Stdout);
-        let mut enable_text_overwrite = stdout_isatty && !verbose && !debug_enabled();
-        let enable_text_coloring;
-        match matches.value_of("color") {
-            Some("always") => {
-                enable_text_coloring = true;
-            }
-            Some("never") => {
-                enable_text_coloring = false;
-                enable_text_overwrite = false;
-            }
-            _ => enable_text_coloring = stdout_isatty,
+        match matches.value_of("plotting-backend") {
+            // Use plotting_backend() here to re-use the panic behavior if Gnuplot is not available.
+            Some("gnuplot") => self = self.plotting_backend(PlottingBackend::Gnuplot),
+            Some("plotters") => self = self.plotting_backend(PlottingBackend::Plotters),
+            Some(val) => panic!("Unexpected plotting backend '{}'", val),
+            None => {}
         }
 
         if matches.is_present("noplot") || matches.is_present("test") {
@@ -1081,11 +1163,33 @@ To test that the benchmarks work, run `cargo test --benches`
         }
 
         let mut reports: Vec<Box<dyn Report>> = vec![];
-        reports.push(Box::new(CliReport::new(
-            enable_text_overwrite,
-            enable_text_coloring,
-            verbose,
-        )));
+
+        let cli_report: Box<dyn Report> = match matches.value_of("output-format") {
+            Some("bencher") => Box::new(BencherReport),
+            _ => {
+                let verbose = matches.is_present("verbose");
+                let stdout_isatty = atty::is(atty::Stream::Stdout);
+                let mut enable_text_overwrite = stdout_isatty && !verbose && !debug_enabled();
+                let enable_text_coloring;
+                match matches.value_of("color") {
+                    Some("always") => {
+                        enable_text_coloring = true;
+                    }
+                    Some("never") => {
+                        enable_text_coloring = false;
+                        enable_text_overwrite = false;
+                    }
+                    _ => enable_text_coloring = stdout_isatty,
+                };
+                Box::new(CliReport::new(
+                    enable_text_overwrite,
+                    enable_text_coloring,
+                    verbose,
+                ))
+            }
+        };
+
+        reports.push(cli_report);
         reports.push(Box::new(FileCsvReport));
 
         if matches.is_present("profile-time") {
@@ -1100,6 +1204,10 @@ To test that the benchmarks work, run `cargo test --benches`
             }
 
             self.profile_time = Some(Duration::from_secs(num_seconds));
+        }
+
+        if let Some(dir) = matches.value_of("load-baseline") {
+            self.load_baseline = Some(dir.to_owned());
         }
 
         let bench = matches.is_present("bench");
@@ -1192,8 +1300,8 @@ To test that the benchmarks work, run `cargo test --benches`
             self.list_mode = true;
         }
 
-        if self.profile_time.is_none() {
-            reports.push(Box::new(Html::new()));
+        if self.profile_time.is_none() && self.plotting_enabled {
+            reports.push(Box::new(Html::new(self.create_plotter())));
         }
 
         self.report = Box::new(Reports::new(reports));
@@ -1203,7 +1311,7 @@ To test that the benchmarks work, run `cargo test --benches`
 
     fn filter_matches(&self, id: &str) -> bool {
         match self.filter {
-            Some(ref string) => id.contains(string),
+            Some(ref regex) => regex.is_match(id),
             None => true,
         }
     }
@@ -1229,7 +1337,7 @@ To test that the benchmarks work, run `cargo test --benches`
     /// criterion_group!(benches, bench_simple);
     /// criterion_main!(benches);
     /// ```
-    pub fn benchmark_group<S: Into<String>>(&mut self, group_name: S) -> BenchmarkGroup<M> {
+    pub fn benchmark_group<S: Into<String>>(&mut self, group_name: S) -> BenchmarkGroup<'_, M> {
         BenchmarkGroup::new(self, group_name.into())
     }
 }
@@ -1260,7 +1368,7 @@ where
     /// ```
     pub fn bench_function<F>(&mut self, id: &str, f: F) -> &mut Criterion<M>
     where
-        F: FnMut(&mut Bencher<M>),
+        F: FnMut(&mut Bencher<'_, M>),
     {
         self.benchmark_group(id)
             .bench_function(BenchmarkId::no_function(), f);
@@ -1292,7 +1400,7 @@ where
     /// ```
     pub fn bench_with_input<F, I>(&mut self, id: BenchmarkId, input: &I, f: F) -> &mut Criterion<M>
     where
-        F: FnMut(&mut Bencher<M>, &I),
+        F: FnMut(&mut Bencher<'_, M>, &I),
     {
         // Guaranteed safe because external callers can't create benchmark IDs without a function
         // name or parameter
@@ -1339,7 +1447,7 @@ where
     where
         I: IntoIterator,
         I::Item: fmt::Debug + 'static,
-        F: FnMut(&mut Bencher<M>, &I::Item) + 'static,
+        F: FnMut(&mut Bencher<'_, M>, &I::Item) + 'static,
     {
         self.bench(id, ParameterizedBenchmark::new(id, f, inputs))
     }
@@ -1431,25 +1539,6 @@ where
     ) -> &mut Criterion<M> {
         benchmark.run(group_id, self);
         self
-    }
-}
-
-mod plotting {
-    #[derive(Debug, Clone, Copy)]
-    pub enum Plotting {
-        Unset,
-        Disabled,
-        Enabled,
-        NotAvailable,
-    }
-
-    impl Plotting {
-        pub fn is_enabled(self) -> bool {
-            match self {
-                Plotting::Enabled => true,
-                _ => false,
-            }
-        }
     }
 }
 

@@ -43,7 +43,6 @@ use std::slice;
 
 use crate::stats::float::Float;
 use crate::stats::univariate::Sample;
-use cast;
 
 use self::Label::*;
 
@@ -58,7 +57,7 @@ use self::Label::*;
 #[derive(Clone, Copy)]
 pub struct LabeledSample<'a, A>
 where
-    A: 'a + Float,
+    A: Float,
 {
     fences: (A, A, A, A),
     sample: &'a Sample<A>,
@@ -170,7 +169,7 @@ where
 /// Iterator over the labeled data
 pub struct Iter<'a, A>
 where
-    A: 'a + Float,
+    A: Float,
 {
     fences: (A, A, A, A),
     iter: slice::Iter<'a, A>,
@@ -267,7 +266,7 @@ impl Label {
 /// Classifies the sample, and returns a labeled sample.
 ///
 /// - Time: `O(N log N) where N = length`
-pub fn classify<A>(sample: &Sample<A>) -> LabeledSample<A>
+pub fn classify<A>(sample: &Sample<A>) -> LabeledSample<'_, A>
 where
     A: Float,
     usize: cast::From<A, Output = Result<usize, cast::Error>>,

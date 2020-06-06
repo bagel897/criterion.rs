@@ -142,21 +142,26 @@ impl<'a, M: Measurement> BenchmarkGroup<'a, M> {
     /// Panics if the number of resamples is set to zero
     pub fn nresamples(&mut self, n: usize) -> &mut Self {
         assert!(n > 0);
+        if n <= 1000 {
+            println!("\nWarning: It is not recommended to reduce nresamples below 1000.");
+        }
 
         self.partial_config.nresamples = Some(n);
         self
     }
 
-    /// Changes the noise threshold for this benchmark group
+    /// Changes the noise threshold for benchmarks in this group. The noise threshold
+    /// is used to filter out small changes in performance from one run to the next, even if they
+    /// are statistically significant. Sometimes benchmarking the same code twice will result in
+    /// small but statistically significant differences solely because of noise. This provides a way
+    /// to filter out some of these false positives at the cost of making it harder to detect small
+    /// changes to the true performance of the benchmark.
     ///
-    /// This threshold is used to decide if an increase of `X%` in the execution time is considered
-    /// significant or should be flagged as noise
-    ///
-    /// *Note:* A value of `0.02` is equivalent to `2%`
+    /// The default is 0.01, meaning that changes smaller than 1% will be ignored.
     ///
     /// # Panics
     ///
-    /// Panics is the threshold is set to a negative value
+    /// Panics if the threshold is set to a negative value
     pub fn noise_threshold(&mut self, threshold: f64) -> &mut Self {
         assert!(threshold >= 0.0);
 
@@ -164,27 +169,40 @@ impl<'a, M: Measurement> BenchmarkGroup<'a, M> {
         self
     }
 
-    /// Changes the confidence level for this benchmark group
-    ///
-    /// The confidence level is used to calculate the
-    /// [confidence intervals](https://en.wikipedia.org/wiki/Confidence_interval) of the estimated
-    /// statistics
+    /// Changes the confidence level for benchmarks in this group. The confidence
+    /// level is the desired probability that the true runtime lies within the estimated
+    /// [confidence interval](https://en.wikipedia.org/wiki/Confidence_interval). The default is
+    /// 0.95, meaning that the confidence interval should capture the true value 95% of the time.
     ///
     /// # Panics
     ///
     /// Panics if the confidence level is set to a value outside the `(0, 1)` range
     pub fn confidence_level(&mut self, cl: f64) -> &mut Self {
         assert!(cl > 0.0 && cl < 1.0);
+        if cl < 0.5 {
+            println!("\nWarning: It is not recommended to reduce confidence level below 0.5.");
+        }
 
         self.partial_config.confidence_level = Some(cl);
         self
     }
 
     /// Changes the [significance level](https://en.wikipedia.org/wiki/Statistical_significance)
-    /// for this benchmark group
+    /// for benchmarks in this group. This is used to perform a
+    /// [hypothesis test](https://en.wikipedia.org/wiki/Statistical_hypothesis_testing) to see if
+    /// the measurements from this run are different from the measured performance of the last run.
+    /// The significance level is the desired probability that two measurements of identical code
+    /// will be considered 'different' due to noise in the measurements. The default value is 0.05,
+    /// meaning that approximately 5% of identical benchmarks will register as different due to
+    /// noise.
     ///
-    /// The significance level is used for
-    /// [hypothesis testing](https://en.wikipedia.org/wiki/Statistical_hypothesis_testing)
+    /// This presents a trade-off. By setting the significance level closer to 0.0, you can increase
+    /// the statistical robustness against noise, but it also weaken's Criterion.rs' ability to
+    /// detect small but real changes in the performance. By setting the significance level
+    /// closer to 1.0, Criterion.rs will be more able to detect small true changes, but will also
+    /// report more spurious differences.
+    ///
+    /// See also the noise threshold setting.
     ///
     /// # Panics
     ///
@@ -209,7 +227,7 @@ impl<'a, M: Measurement> BenchmarkGroup<'a, M> {
         self
     }
 
-    pub(crate) fn new(criterion: &mut Criterion<M>, group_name: String) -> BenchmarkGroup<M> {
+    pub(crate) fn new(criterion: &mut Criterion<M>, group_name: String) -> BenchmarkGroup<'_, M> {
         BenchmarkGroup {
             criterion,
             group_name,
@@ -223,7 +241,7 @@ impl<'a, M: Measurement> BenchmarkGroup<'a, M> {
     /// Benchmark the given parameterless function inside this benchmark group.
     pub fn bench_function<ID: IntoBenchmarkId, F>(&mut self, id: ID, mut f: F) -> &mut Self
     where
-        F: FnMut(&mut Bencher<M>),
+        F: FnMut(&mut Bencher<'_, M>),
     {
         self.run_bench(id.into_benchmark_id(), &(), |b, _| f(b));
         self
@@ -237,7 +255,8 @@ impl<'a, M: Measurement> BenchmarkGroup<'a, M> {
         f: F,
     ) -> &mut Self
     where
-        F: FnMut(&mut Bencher<M>, &I),
+        F: FnMut(&mut Bencher<'_, M>, &I),
+        I: ?Sized,
     {
         self.run_bench(id.into_benchmark_id(), input, f);
         self
@@ -245,12 +264,12 @@ impl<'a, M: Measurement> BenchmarkGroup<'a, M> {
 
     fn run_bench<F, I>(&mut self, id: BenchmarkId, input: &I, f: F)
     where
-        F: FnMut(&mut Bencher<M>, &I),
+        F: FnMut(&mut Bencher<'_, M>, &I),
+        I: ?Sized,
     {
         let config = self.partial_config.to_complete(&self.criterion.config);
         let report_context = ReportContext {
             output_directory: self.criterion.output_directory.clone(),
-            plotting: self.criterion.plotting,
             plot_config: self.partial_config.plot_config.clone(),
             test_mode: self.criterion.test_mode,
         };
@@ -312,7 +331,6 @@ impl<'a, M: Measurement> Drop for BenchmarkGroup<'a, M> {
         {
             let report_context = ReportContext {
                 output_directory: self.criterion.output_directory.clone(),
-                plotting: self.criterion.plotting,
                 plot_config: self.partial_config.plot_config.clone(),
                 test_mode: self.criterion.test_mode,
             };

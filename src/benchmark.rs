@@ -99,7 +99,6 @@ pub trait BenchmarkDefinition<M: Measurement = WallTime>: Sized {
 
 macro_rules! benchmark_config {
     ($type:tt) => {
-
         /// Changes the size of the sample for this benchmark
         ///
         /// A bigger sample should yield more accurate results if paired with a sufficiently large
@@ -157,21 +156,26 @@ macro_rules! benchmark_config {
         /// Panics if the number of resamples is set to zero
         pub fn nresamples(mut self, n: usize) -> Self {
             assert!(n > 0);
+            if n <= 1000 {
+                println!("\nWarning: It is not recommended to reduce nresamples below 1000.");
+            }
 
             self.config.nresamples = Some(n);
             self
         }
 
-        /// Changes the noise threshold for this benchmark
+        /// Changes the default noise threshold for this benchmark. The noise threshold
+        /// is used to filter out small changes in performance, even if they are statistically
+        /// significant. Sometimes benchmarking the same code twice will result in small but
+        /// statistically significant differences solely because of noise. This provides a way to filter
+        /// out some of these false positives at the cost of making it harder to detect small changes
+        /// to the true performance of the benchmark.
         ///
-        /// This threshold is used to decide if an increase of `X%` in the execution time is considered
-        /// significant or should be flagged as noise
-        ///
-        /// *Note:* A value of `0.02` is equivalent to `2%`
+        /// The default is 0.01, meaning that changes smaller than 1% will be ignored.
         ///
         /// # Panics
         ///
-        /// Panics is the threshold is set to a negative value
+        /// Panics if the threshold is set to a negative value
         pub fn noise_threshold(mut self, threshold: f64) -> Self {
             assert!(threshold >= 0.0);
 
@@ -179,27 +183,40 @@ macro_rules! benchmark_config {
             self
         }
 
-        /// Changes the confidence level for this benchmark
-        ///
-        /// The confidence level is used to calculate the
-        /// [confidence intervals](https://en.wikipedia.org/wiki/Confidence_interval) of the estimated
-        /// statistics
+        /// Changes the default confidence level for this benchmark. The confidence
+        /// level is the desired probability that the true runtime lies within the estimated
+        /// [confidence interval](https://en.wikipedia.org/wiki/Confidence_interval). The default is
+        /// 0.95, meaning that the confidence interval should capture the true value 95% of the time.
         ///
         /// # Panics
         ///
         /// Panics if the confidence level is set to a value outside the `(0, 1)` range
         pub fn confidence_level(mut self, cl: f64) -> Self {
             assert!(cl > 0.0 && cl < 1.0);
+            if cl < 0.5 {
+                println!("\nWarning: It is not recommended to reduce confidence level below 0.5.");
+            }
 
             self.config.confidence_level = Some(cl);
             self
         }
 
-        /// Changes the [significance level](https://en.wikipedia.org/wiki/Statistical_significance)
-        /// for this benchmark
+        /// Changes the default [significance level](https://en.wikipedia.org/wiki/Statistical_significance)
+        /// for this benchmark. This is used to perform a
+        /// [hypothesis test](https://en.wikipedia.org/wiki/Statistical_hypothesis_testing) to see if
+        /// the measurements from this run are different from the measured performance of the last run.
+        /// The significance level is the desired probability that two measurements of identical code
+        /// will be considered 'different' due to noise in the measurements. The default value is 0.05,
+        /// meaning that approximately 5% of identical benchmarks will register as different due to
+        /// noise.
         ///
-        /// The significance level is used for
-        /// [hypothesis testing](https://en.wikipedia.org/wiki/Statistical_hypothesis_testing)
+        /// This presents a trade-off. By setting the significance level closer to 0.0, you can increase
+        /// the statistical robustness against noise, but it also weaken's Criterion.rs' ability to
+        /// detect small but real changes in the performance. By setting the significance level
+        /// closer to 1.0, Criterion.rs will be more able to detect small true changes, but will also
+        /// report more spurious differences.
+        ///
+        /// See also the noise threshold setting.
         ///
         /// # Panics
         ///
@@ -216,8 +233,7 @@ macro_rules! benchmark_config {
             self.config.plot_config = new_config;
             self
         }
-
-    }
+    };
 }
 
 impl<M> Benchmark<M>
@@ -250,7 +266,7 @@ where
     pub fn new<S, F>(id: S, f: F) -> Benchmark<M>
     where
         S: Into<String>,
-        F: FnMut(&mut Bencher<M>) + 'static,
+        F: FnMut(&mut Bencher<'_, M>) + 'static,
     {
         Benchmark {
             config: PartialBenchmarkConfig::default(),
@@ -264,7 +280,7 @@ where
     pub fn with_function<S, F>(mut self, id: S, mut f: F) -> Benchmark<M>
     where
         S: Into<String>,
-        F: FnMut(&mut Bencher<M>) + 'static,
+        F: FnMut(&mut Bencher<'_, M>) + 'static,
     {
         let routine = NamedRoutine {
             id: id.into(),
@@ -286,7 +302,6 @@ impl<M: Measurement> BenchmarkDefinition<M> for Benchmark<M> {
     fn run(self, group_id: &str, c: &mut Criterion<M>) {
         let report_context = ReportContext {
             output_directory: c.output_directory.clone(),
-            plotting: c.plotting,
             plot_config: self.config.plot_config.clone(),
             test_mode: c.test_mode,
         };
@@ -393,7 +408,7 @@ where
     pub fn new<S, F, I>(id: S, f: F, parameters: I) -> ParameterizedBenchmark<T, M>
     where
         S: Into<String>,
-        F: FnMut(&mut Bencher<M>, &T) + 'static,
+        F: FnMut(&mut Bencher<'_, M>, &T) + 'static,
         I: IntoIterator<Item = T>,
     {
         ParameterizedBenchmark {
@@ -409,7 +424,7 @@ where
     pub fn with_function<S, F>(mut self, id: S, f: F) -> ParameterizedBenchmark<T, M>
     where
         S: Into<String>,
-        F: FnMut(&mut Bencher<M>, &T) + 'static,
+        F: FnMut(&mut Bencher<'_, M>, &T) + 'static,
     {
         let routine = NamedRoutine {
             id: id.into(),
@@ -436,7 +451,6 @@ where
     fn run(self, group_id: &str, c: &mut Criterion<M>) {
         let report_context = ReportContext {
             output_directory: c.output_directory.clone(),
-            plotting: c.plotting,
             plot_config: self.config.plot_config.clone(),
             test_mode: c.test_mode,
         };

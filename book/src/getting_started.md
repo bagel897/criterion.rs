@@ -39,13 +39,7 @@ file at `$PROJECT/benches/my_benchmark.rs` with the following contents (see the 
 below for an explanation of this code):
 
 ```rust
-#[macro_use]
-extern crate criterion;
-extern crate mycrate;
-
-use criterion::Criterion;
-use criterion::black_box;
-
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use mycrate::fibonacci;
 
 pub fn criterion_benchmark(c: &mut Criterion) {
@@ -84,13 +78,7 @@ median [25.733 us 25.988 us] med. abs. dev. [234.09 ns 544.07 ns]
 Let's go back and walk through that benchmark code in more detail.
 
 ```rust
-#[macro_use]
-extern crate criterion;
-extern crate mycrate;
-
-use criterion::Criterion;
-use criterion::black_box;
-
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use mycrate::fibonacci;
 ```
 
@@ -149,20 +137,20 @@ This fibonacci function is quite inefficient. We can do better:
 
 ```rust
 fn fibonacci(n: u64) -> u64 {
-    let mut a = 0u64;
-    let mut b = 1u64;
-    let mut c = 0u64;
+    let mut a = 0;
+    let mut b = 1;
 
-    if n == 0 {
-        return 0
+    match n {
+        0 => b,
+        _ => {
+            for _ in 0..n {
+                let c = a + b;
+                a = b;
+                b = c;
+            }
+            b
+        }
     }
-
-    for _ in 0..(n+1) {
-        c = a + b;
-        a = b;
-        b = c;
-    }
-    return b;
 }
 ```
 

@@ -1,42 +1,23 @@
 use crate::report::{make_filename_safe, BenchmarkId, MeasurementData, Report, ReportContext};
 use crate::stats::bivariate::regression::Slope;
-use crate::stats::bivariate::Data;
 
 use crate::estimate::Statistic;
 use crate::format;
 use crate::fs;
 use crate::measurement::ValueFormatter;
-use crate::plot;
+use crate::plot::{PlotContext, PlotData, Plotter};
 use crate::Estimate;
 use criterion_plot::Size;
 use serde::Serialize;
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::process::Child;
 use tinytemplate::TinyTemplate;
 
 const THUMBNAIL_SIZE: Option<Size> = Some(Size(450, 300));
 
-fn wait_on_gnuplot(children: Vec<Child>) {
-    let start = ::std::time::Instant::now();
-    let child_count = children.len();
-    for child in children {
-        match child.wait_with_output() {
-            Ok(ref out) if out.status.success() => {}
-            Ok(out) => error!("Error in Gnuplot: {}", String::from_utf8_lossy(&out.stderr)),
-            Err(e) => error!("Got IO error while waiting for Gnuplot to complete: {}", e),
-        }
-    }
-    let elapsed = &start.elapsed();
-    info!(
-        "Waiting for {} gnuplot processes took {}",
-        child_count,
-        format::time(crate::DurationExt::to_nanos(elapsed) as f64)
-    );
-}
-
-fn debug_context<S: Serialize>(path: &str, context: &S) {
+fn debug_context<S: Serialize>(path: &Path, context: &S) {
     if crate::debug_enabled() {
         let mut context_path = PathBuf::from(path);
         context_path.set_extension("json");
@@ -130,7 +111,7 @@ struct Comparison {
     additional_plots: Vec<Plot>,
 }
 
-fn if_exists(output_directory: &str, path: &Path) -> Option<String> {
+fn if_exists(output_directory: &Path, path: &Path) -> Option<String> {
     let report_path = path.join("report/index.html");
     if PathBuf::from(output_directory).join(&report_path).is_file() {
         Some(report_path.to_string_lossy().to_string())
@@ -145,7 +126,7 @@ struct ReportLink<'a> {
 }
 impl<'a> ReportLink<'a> {
     // TODO: Would be nice if I didn't have to keep making these components filename-safe.
-    fn group(output_directory: &str, group_id: &'a str) -> ReportLink<'a> {
+    fn group(output_directory: &Path, group_id: &'a str) -> ReportLink<'a> {
         let path = PathBuf::from(make_filename_safe(group_id));
 
         ReportLink {
@@ -154,7 +135,7 @@ impl<'a> ReportLink<'a> {
         }
     }
 
-    fn function(output_directory: &str, group_id: &str, function_id: &'a str) -> ReportLink<'a> {
+    fn function(output_directory: &Path, group_id: &str, function_id: &'a str) -> ReportLink<'a> {
         let mut path = PathBuf::from(make_filename_safe(group_id));
         path.push(make_filename_safe(function_id));
 
@@ -164,7 +145,7 @@ impl<'a> ReportLink<'a> {
         }
     }
 
-    fn value(output_directory: &str, group_id: &str, value_str: &'a str) -> ReportLink<'a> {
+    fn value(output_directory: &Path, group_id: &str, value_str: &'a str) -> ReportLink<'a> {
         let mut path = PathBuf::from(make_filename_safe(group_id));
         path.push(make_filename_safe(value_str));
 
@@ -174,7 +155,7 @@ impl<'a> ReportLink<'a> {
         }
     }
 
-    fn individual(output_directory: &str, id: &'a BenchmarkId) -> ReportLink<'a> {
+    fn individual(output_directory: &Path, id: &'a BenchmarkId) -> ReportLink<'a> {
         let path = PathBuf::from(id.as_directory_name());
         ReportLink {
             name: id.as_title(),
@@ -199,7 +180,7 @@ struct BenchmarkGroup<'a> {
     individual_links: Vec<BenchmarkValueGroup<'a>>,
 }
 impl<'a> BenchmarkGroup<'a> {
-    fn new(output_directory: &str, ids: &[&'a BenchmarkId]) -> BenchmarkGroup<'a> {
+    fn new(output_directory: &Path, ids: &[&'a BenchmarkId]) -> BenchmarkGroup<'a> {
         let group_id = &ids[0].group_id;
         let group_report = ReportLink::group(output_directory, group_id);
 
@@ -279,9 +260,10 @@ struct IndexContext<'a> {
 
 pub struct Html {
     templates: TinyTemplate<'static>,
+    plotter: RefCell<Box<dyn Plotter>>,
 }
 impl Html {
-    pub fn new() -> Html {
+    pub(crate) fn new(plotter: Box<dyn Plotter>) -> Html {
         let mut templates = TinyTemplate::new();
         templates
             .add_template("report_link", include_str!("report_link.html.tt"))
@@ -296,7 +278,8 @@ impl Html {
             .add_template("summary_report", include_str!("summary_report.html.tt"))
             .expect("Unable to parse summary_report template");
 
-        Html { templates }
+        let plotter = RefCell::new(plotter);
+        Html { templates, plotter }
     }
 }
 impl Report for Html {
@@ -304,18 +287,15 @@ impl Report for Html {
         &self,
         id: &BenchmarkId,
         report_context: &ReportContext,
-        measurements: &MeasurementData,
+        measurements: &MeasurementData<'_>,
         formatter: &dyn ValueFormatter,
     ) {
-        if !report_context.plotting.is_enabled() {
-            return;
-        }
-
-        try_else_return!(fs::mkdirp(&format!(
-            "{}/{}/report/",
-            report_context.output_directory,
-            id.as_directory_name()
-        )));
+        try_else_return!({
+            let mut report_dir = report_context.output_directory.clone();
+            report_dir.push(id.as_directory_name());
+            report_dir.push("report");
+            fs::mkdirp(&report_dir)
+        });
 
         let slope_estimate = &measurements.absolute_estimates[&Statistic::Slope];
 
@@ -395,19 +375,17 @@ impl Report for Html {
             comparison: self.comparison(measurements),
         };
 
-        let report_path = &format!(
-            "{}/{}/report/index.html",
-            report_context.output_directory,
-            id.as_directory_name()
-        );
-
+        let mut report_path = report_context.output_directory.clone();
+        report_path.push(id.as_directory_name());
+        report_path.push("report");
+        report_path.push("index.html");
         debug_context(&report_path, &context);
 
         let text = self
             .templates
             .render("benchmark_report", &context)
             .expect("Failed to render benchmark report template");
-        try_else_return!(fs::save_string(&text, report_path,));
+        try_else_return!(fs::save_string(&text, &report_path));
     }
 
     fn summarize(
@@ -416,22 +394,14 @@ impl Report for Html {
         all_ids: &[BenchmarkId],
         formatter: &dyn ValueFormatter,
     ) {
-        if !context.plotting.is_enabled() {
-            return;
-        }
-
         let all_ids = all_ids
             .iter()
             .filter(|id| {
-                fs::is_dir(&format!(
-                    "{}/{}",
-                    context.output_directory,
-                    id.as_directory_name()
-                ))
+                let id_dir = context.output_directory.join(id.as_directory_name());
+                fs::is_dir(&id_dir)
             })
             .collect::<Vec<_>>();
 
-        let mut all_plots = vec![];
         let group_id = all_ids[0].group_id.clone();
 
         let data = self.load_summary_data(&context.output_directory, &all_ids);
@@ -477,13 +447,13 @@ impl Report for Html {
                 let subgroup_id =
                     BenchmarkId::new(group_id.clone(), Some(function_id.clone()), None, None);
 
-                all_plots.extend(self.generate_summary(
+                self.generate_summary(
                     &subgroup_id,
                     &*samples_with_function,
                     context,
                     formatter,
                     false,
-                ));
+                );
             }
         }
 
@@ -498,13 +468,13 @@ impl Report for Html {
                 let subgroup_id =
                     BenchmarkId::new(group_id.clone(), None, Some(value_str.clone()), None);
 
-                all_plots.extend(self.generate_summary(
+                self.generate_summary(
                     &subgroup_id,
                     &*samples_with_value,
                     context,
                     formatter,
                     false,
-                ));
+                );
             }
         }
 
@@ -533,21 +503,17 @@ impl Report for Html {
         // function name, then value. This one has to be a stable sort.
         all_data.sort_by_key(|(id, _)| id.function_id.as_ref());
 
-        all_plots.extend(self.generate_summary(
+        self.generate_summary(
             &BenchmarkId::new(group_id, None, None, None),
             &*(all_data),
             context,
             formatter,
             true,
-        ));
-        wait_on_gnuplot(all_plots)
+        );
+        self.plotter.borrow_mut().wait();
     }
 
     fn final_summary(&self, report_context: &ReportContext) {
-        if !report_context.plotting.is_enabled() {
-            return;
-        }
-
         let output_directory = &report_context.output_directory;
         if !fs::is_dir(&output_directory) {
             return;
@@ -568,12 +534,12 @@ impl Report for Html {
         let mut groups = id_groups
             .into_iter()
             .map(|(_, group)| BenchmarkGroup::new(output_directory, &group))
-            .collect::<Vec<BenchmarkGroup>>();
+            .collect::<Vec<BenchmarkGroup<'_>>>();
         groups.sort_unstable_by_key(|g| g.group_report.name);
 
-        try_else_return!(fs::mkdirp(&format!("{}/report/", output_directory)));
+        try_else_return!(fs::mkdirp(&output_directory.join("report")));
 
-        let report_path = &format!("{}/report/index.html", output_directory);
+        let report_path = output_directory.join("report").join("index.html");
 
         let context = IndexContext { groups };
 
@@ -583,11 +549,11 @@ impl Report for Html {
             .templates
             .render("index", &context)
             .expect("Failed to render index template");
-        try_else_return!(fs::save_string(&text, report_path,));
+        try_else_return!(fs::save_string(&text, &report_path,));
     }
 }
 impl Html {
-    fn comparison(&self, measurements: &MeasurementData) -> Option<Comparison> {
+    fn comparison(&self, measurements: &MeasurementData<'_>) -> Option<Comparison> {
         if let Some(ref comp) = measurements.comparison {
             let different_mean = comp.p_value < comp.significance_threshold;
             let mean_est = comp.relative_estimates[&Statistic::Mean];
@@ -654,91 +620,77 @@ impl Html {
         id: &BenchmarkId,
         context: &ReportContext,
         formatter: &dyn ValueFormatter,
-        measurements: &MeasurementData,
+        measurements: &MeasurementData<'_>,
     ) {
-        let mut gnuplots = vec![
-            // Probability density plots
-            plot::pdf(id, context, formatter, measurements, None),
-            plot::pdf_small(id, context, formatter, measurements, THUMBNAIL_SIZE),
-            // Linear regression plots
-            plot::regression(id, context, formatter, measurements, None),
-            plot::regression_small(id, context, formatter, measurements, THUMBNAIL_SIZE),
-        ];
-        gnuplots.extend(plot::abs_distributions(
+        let plot_ctx = PlotContext {
             id,
             context,
-            formatter,
+            size: None,
+            is_thumbnail: false,
+        };
+
+        let plot_data = PlotData {
             measurements,
-            None,
-        ));
+            formatter,
+            comparison: None,
+        };
+
+        let plot_ctx_small = plot_ctx.thumbnail(true).size(THUMBNAIL_SIZE);
+
+        self.plotter.borrow_mut().pdf(plot_ctx, plot_data);
+        self.plotter.borrow_mut().pdf(plot_ctx_small, plot_data);
+        self.plotter.borrow_mut().regression(plot_ctx, plot_data);
+        self.plotter
+            .borrow_mut()
+            .regression(plot_ctx_small, plot_data);
+
+        self.plotter
+            .borrow_mut()
+            .abs_distributions(plot_ctx, plot_data);
 
         if let Some(ref comp) = measurements.comparison {
-            try_else_return!(fs::mkdirp(&format!(
-                "{}/{}/report/change/",
-                context.output_directory,
-                id.as_directory_name()
-            )));
+            try_else_return!({
+                let mut change_dir = context.output_directory.clone();
+                change_dir.push(id.as_directory_name());
+                change_dir.push("report");
+                change_dir.push("change");
+                fs::mkdirp(&change_dir)
+            });
 
-            try_else_return!(fs::mkdirp(&format!(
-                "{}/{}/report/both",
-                context.output_directory,
-                id.as_directory_name()
-            )));
+            try_else_return!({
+                let mut both_dir = context.output_directory.clone();
+                both_dir.push(id.as_directory_name());
+                both_dir.push("report");
+                both_dir.push("both");
+                fs::mkdirp(&both_dir)
+            });
 
-            let base_data = Data::new(&comp.base_iter_counts, &comp.base_sample_times);
-            gnuplots.append(&mut vec![
-                plot::regression_comparison(
-                    id,
-                    context,
-                    formatter,
-                    measurements,
-                    comp,
-                    &base_data,
-                    None,
-                ),
-                plot::regression_comparison_small(
-                    id,
-                    context,
-                    formatter,
-                    measurements,
-                    comp,
-                    &base_data,
-                    THUMBNAIL_SIZE,
-                ),
-                plot::pdf_comparison(id, context, formatter, measurements, comp, None),
-                plot::pdf_comparison_small(
-                    id,
-                    context,
-                    formatter,
-                    measurements,
-                    comp,
-                    THUMBNAIL_SIZE,
-                ),
-                plot::t_test(id, context, measurements, comp, None),
-            ]);
-            gnuplots.extend(plot::rel_distributions(
-                id,
-                context,
-                measurements,
-                comp,
-                None,
-            ));
+            let comp_data = plot_data.comparison(&comp);
+
+            self.plotter.borrow_mut().pdf(plot_ctx, comp_data);
+            self.plotter.borrow_mut().pdf(plot_ctx_small, comp_data);
+            self.plotter.borrow_mut().regression(plot_ctx, comp_data);
+            self.plotter
+                .borrow_mut()
+                .regression(plot_ctx_small, comp_data);
+            self.plotter.borrow_mut().t_test(plot_ctx, comp_data);
+            self.plotter
+                .borrow_mut()
+                .rel_distributions(plot_ctx, comp_data);
         }
 
-        wait_on_gnuplot(gnuplots);
+        self.plotter.borrow_mut().wait();
     }
 
     fn load_summary_data<'a>(
         &self,
-        output_directory: &str,
+        output_directory: &Path,
         all_ids: &[&'a BenchmarkId],
     ) -> Vec<(&'a BenchmarkId, Vec<f64>)> {
-        let output_dir = Path::new(output_directory);
-
         all_ids
             .iter()
             .filter_map(|id| {
-                let entry = output_dir.join(id.as_directory_name()).join("new");
+                let entry = output_directory.join(id.as_directory_name()).join("new");
 
                 let (iters, times): (Vec<f64>, Vec<f64>) =
                     try_else_return!(fs::load(&entry.join("sample.json")), || None);
@@ -760,30 +712,25 @@ impl Html {
         report_context: &ReportContext,
         formatter: &dyn ValueFormatter,
         full_summary: bool,
-    ) -> Vec<Child> {
-        let mut gnuplots = vec![];
+    ) {
+        let plot_ctx = PlotContext {
+            id,
+            context: report_context,
+            size: None,
+            is_thumbnail: false,
+        };
 
         try_else_return!(
-            fs::mkdirp(&format!(
-                "{}/{}/report/",
-                report_context.output_directory,
-                id.as_directory_name()
-            )),
-            || gnuplots
+            {
+                let mut report_dir = report_context.output_directory.clone();
+                report_dir.push(id.as_directory_name());
+                report_dir.push("report");
+                fs::mkdirp(&report_dir)
+            },
+            || {}
         );
 
-        let violin_path = format!(
-            "{}/{}/report/violin.svg",
-            report_context.output_directory,
-            id.as_directory_name()
-        );
-        gnuplots.push(plot::violin(
-            formatter,
-            id.as_title(),
-            data,
-            &violin_path,
-            report_context.plot_config.summary_scale,
-        ));
+        self.plotter.borrow_mut().violin(plot_ctx, formatter, data);
 
         let value_types: Vec<_> = data.iter().map(|&&(ref id, _)| id.value_type()).collect();
         let mut line_path = None;
@@ -792,22 +739,10 @@ impl Html {
             if let Some(value_type) = value_types[0] {
                 let values: Vec<_> = data.iter().map(|&&(ref id, _)| id.as_number()).collect();
                 if values.iter().any(|x| x != &values[0]) {
-                    let path = format!(
-                        "{}/{}/report/lines.svg",
-                        report_context.output_directory,
-                        id.as_directory_name()
-                    );
-
-                    gnuplots.push(plot::line_comparison(
-                        formatter,
-                        id.as_title(),
-                        data,
-                        &path,
-                        value_type,
-                        report_context.plot_config.summary_scale,
-                    ));
-
-                    line_path = Some(path);
+                    self.plotter
+                        .borrow_mut()
+                        .line_comparison(plot_ctx, formatter, data, value_type);
+                    line_path = Some(plot_ctx.line_comparison_path());
                 }
             }
         }
@@ -821,20 +756,10 @@ impl Html {
         let all_throughputs_match =
             value_types.iter().all(|x| x == &value_types[0]) && throughput_types[0].is_some();
         if all_throughputs_match {
-            let path = format!(
-                "{}/{}/report/lines_tput.svg",
-                report_context.output_directory,
-                id.as_directory_name()
-            );
-
-            gnuplots.push(plot::comparison_throughput(
-                formatter,
-                id.as_title(),
-                data,
-                &path,
-                report_context.plot_config.summary_scale,
-            ));
-            line_tput_path = Some(path);
+            self.plotter
+                .borrow_mut()
+                .throughput_comparison(plot_ctx, formatter, data);
+            line_tput_path = Some(plot_ctx.throughput_comparison_path());
         }
 
         let path_prefix = if full_summary { "../.." } else { "../../.." };
@@ -849,28 +774,23 @@ impl Html {
             thumbnail_width: THUMBNAIL_SIZE.unwrap().0,
             thumbnail_height: THUMBNAIL_SIZE.unwrap().1,
 
-            violin_plot: Some(violin_path),
-            line_chart: line_path,
-            line_chart_tput: line_tput_path,
-
+            violin_plot: Some(plot_ctx.violin_path().to_string_lossy().into_owned()),
+            line_chart: line_path.map(|p| p.to_string_lossy().into_owned()),
+            line_chart_tput: line_tput_path.map(|p| p.to_string_lossy().into_owned()),
             benchmarks,
         };
 
-        let report_path = &format!(
-            "{}/{}/report/index.html",
-            report_context.output_directory,
-            id.as_directory_name()
-        );
-
+        let mut report_path = report_context.output_directory.clone();
+        report_path.push(id.as_directory_name());
+        report_path.push("report");
+        report_path.push("index.html");
         debug_context(&report_path, &context);
 
         let text = self
             .templates
             .render("summary_report", &context)
             .expect("Failed to render summary report template");
-        try_else_return!(fs::save_string(&text, report_path,), || gnuplots);
-
-        gnuplots
+        try_else_return!(fs::save_string(&text, &report_path,), || {});
     }
 }
 

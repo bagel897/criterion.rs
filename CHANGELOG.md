@@ -6,6 +6,46 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [ 0.3.2] - 2020-04-26
+### Added
+- Added `?Sized` bound to benchmark parameter types, which allows dynamically sized types like
+  `&str` and `&[T]` to be used as benchmark parameters.
+- Added the `--output-format <format>` command-line option. If `--output-format bencher` is passed,
+  Criterion.rs will print its measurements in a format similar to that used by the `bencher` crate
+  or unstable `libtest` benchmarks, and using similar statistical measurements as well. Though this
+  provides less information than the default format, it may be useful for supporting tools which
+  parse this output format.
+- Added `--nocapture` argument. This argument does nothing, but prevents Criterion.rs from exiting
+  when running tests or benchmarks and allowing stdout output from other tests.
+
+### Fixed
+- Fixed panic when environment variables contains non-UTF8 characters.
+- Fixed panic when `CRITERION_DEBUG` or `CRITERION_TARGET_DIR` environment variables contain 
+  non-UTF8 characters.
+
+## [0.3.1] - 2020-01-25
+### Added
+- Added new plotting backend using the `plotters` crate. Implementation generously provided by Hao 
+  Hou, author of the `plotters` crate.
+- Added `--plotting-backend` command-line option to select the plotting backend. The existing 
+  gnuplot backend will be used by default when available, and the plotters backend will be used when
+  gnuplot is not available or when requested.
+- Added `Criterion::plotting_backend()` function to configure the plotting backend in code.
+- Added `--load-baseline` command-line option to load a baseline for comparison
+  rather than measuring the current code
+- Benchmark filters can now be regular expressions.
+
+### Fixed
+- Fixed `fibonacci` functions.
+- Fixed `#[criterion]` benchmarks ignoring the command-line options.
+- Fixed incorrect scaling of the violin plots.
+- Don't print the recommended sample count if it's the same as the configured
+  sample count.
+- Fix potential panic when `nresamples` is set too low. Also added a warning
+  against setting `nresamples` too low.
+- Fixed issue where a slow outer closure would cause Criterion.rs to calculate 
+  the wrong estimated time and number of iterations in the warm-up phase.
+
 ## [0.3.0] - 2019-08-25
 ### Added
 - Added support for plugging in custom measurements (eg. processor counters)
@@ -291,7 +331,7 @@ more details
 - Initial release on Crates.io.
 
 
-[Unreleased]: https://github.com/bheisler/criterion.rs/compare/0.3.0...HEAD
+[Unreleased]: https://github.com/bheisler/criterion.rs/compare/0.3.2...HEAD
 [0.1.1]: https://github.com/bheisler/criterion.rs/compare/0.1.0...0.1.1
 [0.1.2]: https://github.com/bheisler/criterion.rs/compare/0.1.1...0.1.2
 [0.2.0]: https://github.com/bheisler/criterion.rs/compare/0.1.2...0.2.0
@@ -307,3 +347,5 @@ more details
 [0.2.10]: https://github.com/bheisler/criterion.rs/compare/0.2.9...0.2.10
 [0.2.11]: https://github.com/bheisler/criterion.rs/compare/0.2.10...0.2.11
 [0.3.0]: https://github.com/bheisler/criterion.rs/compare/0.2.11...0.3.0
+[0.3.1]: https://github.com/bheisler/criterion.rs/compare/0.3.0...0.3.1
+[0.3.2]: https://github.com/bheisler/criterion.rs/compare/0.3.1...0.3.2

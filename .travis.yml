@@ -12,14 +12,7 @@ os:
   - osx
 
 matrix:
-  # Clear the whole matrix
-  exclude:
-    - os: linux
-    - os: osx
-  # Add each target manually
   include:
-    - os: linux
-      env: GNUPLOT=no
     - os: linux
       env: GNUPLOT=yes
       addons:
@@ -36,7 +29,7 @@ matrix:
       env: DOCS=yes
     - os: linux
       env: GNUPLOT=yes
-      rust: 1.32.0
+      rust: 1.33.0
       addons:
         apt:
           packages:
@@ -51,8 +44,6 @@ matrix:
         apt:
           packages:
             - gnuplot
-    - os: osx
-      env: GNUPLOT=no
     - os: osx
       env: GNUPLOT=yes
     - os: osx

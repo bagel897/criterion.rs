@@ -4,7 +4,6 @@ use crate::stats::float::Float;
 use crate::stats::tuple::{Tuple, TupledDistributionsBuilder};
 use crate::stats::univariate::Percentiles;
 use crate::stats::univariate::Resamples;
-use cast;
 use rayon::prelude::*;
 
 /// A collection of data points drawn from a population
@@ -120,12 +119,10 @@ where
         where
             T: PartialOrd,
         {
-            if a < b {
-                Ordering::Less
-            } else if a == b {
-                Ordering::Equal
-            } else {
-                Ordering::Greater
+            match a.partial_cmp(b) {
+                Some(o) => o,
+                // Arbitrary way to handle NaNs that should never happen
+                None => Ordering::Equal,
             }
         }
 
@@ -204,10 +201,8 @@ where
     /// - Memory: `O(nresamples)`
     pub fn bootstrap<T, S>(&self, nresamples: usize, statistic: S) -> T::Distributions
     where
-        S: Fn(&Sample<A>) -> T,
-        S: Sync,
-        T: Tuple,
-        T: Send,
+        S: Fn(&Sample<A>) -> T + Sync,
+        T: Tuple + Send,
         T::Distributions: Send,
         T::Builder: Send,
     {

@@ -8,7 +8,7 @@ use crate::measurement::ValueFormatter;
 use crate::stats::univariate::Sample;
 use crate::stats::Distribution;
 use crate::Estimate;
-use crate::{PlotConfiguration, Plotting, Throughput};
+use crate::{PlotConfiguration, Throughput};
 use std::cell::Cell;
 use std::cmp;
 use std::collections::HashSet;
@@ -224,12 +224,12 @@ impl BenchmarkId {
     }
 }
 impl fmt::Display for BenchmarkId {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_title())
     }
 }
 impl fmt::Debug for BenchmarkId {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fn format_opt(opt: &Option<String>) -> String {
             match *opt {
                 Some(ref string) => format!("\"{}\"", string),
@@ -249,18 +249,15 @@ impl fmt::Debug for BenchmarkId {
 }
 
 pub struct ReportContext {
-    pub output_directory: String,
-    pub plotting: Plotting,
+    pub output_directory: PathBuf,
     pub plot_config: PlotConfiguration,
     pub test_mode: bool,
 }
 impl ReportContext {
     pub fn report_path<P: AsRef<Path> + ?Sized>(&self, id: &BenchmarkId, file_name: &P) -> PathBuf {
-        let mut path = PathBuf::from(format!(
-            "{}/{}/report",
-            self.output_directory,
-            id.as_directory_name()
-        ));
+        let mut path = self.output_directory.clone();
+        path.push(id.as_directory_name());
+        path.push("report");
         path.push(file_name);
         path
     }
@@ -285,7 +282,7 @@ pub(crate) trait Report {
         &self,
         _id: &BenchmarkId,
         _context: &ReportContext,
-        _measurements: &MeasurementData,
+        _measurements: &MeasurementData<'_>,
         _formatter: &dyn ValueFormatter,
     ) {
     }
@@ -355,7 +352,7 @@ impl Report for Reports {
         &self,
         id: &BenchmarkId,
         context: &ReportContext,
-        measurements: &MeasurementData,
+        measurements: &MeasurementData<'_>,
         formatter: &dyn ValueFormatter,
     ) {
         for report in &self.reports {
@@ -465,7 +462,7 @@ impl CliReport {
         }
     }
 
-    pub fn outliers(&self, sample: &LabeledSample<f64>) {
+    pub fn outliers(&self, sample: &LabeledSample<'_, f64>) {
         let (los, lom, _, him, his) = sample.count();
         let noutliers = los + lom + him + his;
         let sample_size = sample.len();
@@ -567,7 +564,7 @@ impl Report for CliReport {
         &self,
         id: &BenchmarkId,
         _: &ReportContext,
-        meas: &MeasurementData,
+        meas: &MeasurementData<'_>,
         formatter: &dyn ValueFormatter,
     ) {
         self.text_overwrite();
@@ -741,6 +738,41 @@ impl Report for CliReport {
                 format_short_estimate(&meas.absolute_estimates[&Statistic::MedianAbsDev]),
             );
         }
+    }
+}
+
+pub struct BencherReport;
+impl Report for BencherReport {
+    fn measurement_start(
+        &self,
+        id: &BenchmarkId,
+        _context: &ReportContext,
+        _sample_count: u64,
+        _estimate_ns: f64,
+        _iter_count: u64,
+    ) {
+        print!("test {} ... ", id);
+    }
+
+    fn measurement_complete(
+        &self,
+        _id: &BenchmarkId,
+        _: &ReportContext,
+        meas: &MeasurementData<'_>,
+        formatter: &dyn ValueFormatter,
+    ) {
+        let mut values = [
+            meas.absolute_estimates[&Statistic::Median].point_estimate,
+            meas.absolute_estimates[&Statistic::StdDev].point_estimate,
+        ];
+        let unit = formatter.scale_for_machines(&mut values);
+
+        println!(
+            "bench: {:>11} {}/iter (+/- {})",
+            format::integer(values[0]),
+            unit,
+            format::integer(values[1])
+        );
     }
 }
 

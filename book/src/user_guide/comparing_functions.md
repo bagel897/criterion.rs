@@ -5,9 +5,7 @@ graphs to show the differences in performance between them. First, lets create a
 benchmark. We can even combine this with benchmarking over a range of inputs.
 
 ```rust
-#[macro_use]
-extern crate criterion;
-use criterion::Criterion;
+use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
 
 fn fibonacci_slow(n: u64) -> u64 {
     match n {
@@ -18,21 +16,22 @@ fn fibonacci_slow(n: u64) -> u64 {
 }
 
 fn fibonacci_fast(n: u64) -> u64 {
-    let mut a = 0u64;
-    let mut b = 1u64;
-    let mut c = 0u64;
+    let mut a = 0;
+    let mut b = 1;
 
-    if n == 0 {
-        return 0
+    match n {
+        0 => b,
+        _ => {
+            for _ in 0..n {
+                let c = a + b;
+                a = b;
+                b = c;
+            }
+            b
+        }
     }
-
-    for _ in 0..(n+1) {
-        c = a + b;
-        a = b;
-        b = c;
-    }
-    return b;
 }
+
 
 fn bench_fibs(c: &mut Criterion) {
     let mut group = c.benchmark_group("Fibonacci");
@@ -85,6 +84,6 @@ each implementation.
 ![Line Chart](./lines.svg)
 
 The line chart shows a comparison of the different functions as the input or input size increases,
-which can be enabled with ParameterizedBenchmark.
+which can be generated with `Criterion::benchmark_group`.
 
     
