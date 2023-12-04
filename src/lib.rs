@@ -36,7 +36,6 @@ extern crate approx;
 #[cfg(test)]
 extern crate quickcheck;
 
-use is_terminal::IsTerminal;
 use regex::Regex;
 
 #[cfg(feature = "real_blackbox")]
@@ -77,7 +76,7 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::default::Default;
 use std::env;
-use std::io::stdout;
+use std::io::{stdout, IsTerminal};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -172,8 +171,7 @@ pub fn black_box<T>(dummy: T) -> T {
     }
 }
 
-/// Argument to [`Bencher::iter_batched`](struct.Bencher.html#method.iter_batched) and
-/// [`Bencher::iter_batched_ref`](struct.Bencher.html#method.iter_batched_ref) which controls the
+/// Argument to [`Bencher::iter_batched`] and [`Bencher::iter_batched_ref`] which controls the
 /// batch size.
 ///
 /// Generally speaking, almost all benchmarks should use `SmallInput`. If the input or the result
@@ -193,7 +191,7 @@ pub fn black_box<T>(dummy: T) -> T {
 ///
 /// With that said, if the runtime of your function is small relative to the measurement overhead
 /// it will be difficult to take accurate measurements. In this situation, the best option is to use
-/// [`Bencher::iter`](struct.Bencher.html#method.iter) which has next-to-zero measurement overhead.
+/// [`Bencher::iter`] which has next-to-zero measurement overhead.
 #[derive(Debug, Eq, PartialEq, Copy, Hash, Clone)]
 pub enum BatchSize {
     /// `SmallInput` indicates that the input to the benchmark routine (the value returned from
@@ -258,19 +256,19 @@ impl BatchSize {
     }
 }
 
-/// Baseline describes how the baseline_directory is handled.
+/// Baseline describes how the `baseline_directory` is handled.
 #[derive(Debug, Clone, Copy)]
 pub enum Baseline {
-    /// CompareLenient compares against a previous saved version of the baseline.
+    /// `CompareLenient` compares against a previous saved version of the baseline.
     /// If a previous baseline does not exist, the benchmark is run as normal but no comparison occurs.
     CompareLenient,
-    /// CompareStrict compares against a previous saved version of the baseline.
+    /// `CompareStrict` compares against a previous saved version of the baseline.
     /// If a previous baseline does not exist, a panic occurs.
     CompareStrict,
-    /// Save writes the benchmark results to the baseline directory,
+    /// `Save` writes the benchmark results to the baseline directory,
     /// overwriting any results that were previously there.
     Save,
-    /// Discard benchmark results.
+    /// `Discard` benchmark results.
     Discard,
 }
 
@@ -903,6 +901,11 @@ impl<M: Measurement> Criterion<M> {
                 .help("Ignored, but added for compatibility with libtest."))
             .arg(Arg::new("show-output")
                 .long("show-output")
+                .num_args(0)
+                .hide(true)
+                .help("Ignored, but added for compatibility with libtest."))
+            .arg(Arg::new("include-ignored")
+                .long("include-ignored")
                 .num_args(0)
                 .hide(true)
                 .help("Ignored, but added for compatibility with libtest."))
